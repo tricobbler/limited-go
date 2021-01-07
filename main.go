@@ -6,20 +6,26 @@ import (
 	"github.com/nacos-group/nacos-sdk-go/clients"
 	"github.com/nacos-group/nacos-sdk-go/clients/naming_client"
 	"github.com/nacos-group/nacos-sdk-go/common/constant"
+	"github.com/nacos-group/nacos-sdk-go/model"
 	"github.com/nacos-group/nacos-sdk-go/vo"
 	"math/rand"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"reflect"
 	"strings"
+	"sync"
 	"time"
 )
 
+var rwLock *sync.RWMutex
 var client naming_client.INamingClient
+var ServiceRoute map[string][]model.SubscribeService
 
 func main() {
-
 	rand.Seed(time.Now().UTC().UnixNano())
+	ServiceRoute = make(map[string][]model.SubscribeService)
+	rwLock = new(sync.RWMutex)
 
 	sc := []constant.ServerConfig{
 		{
@@ -31,7 +37,7 @@ func main() {
 
 	cc := constant.ClientConfig{
 		TimeoutMs:   500,
-		NamespaceId: "c0d565da-10ef-40a4-84b2-0b19dc25c4db",
+		NamespaceId: "27fdefc2-ae39-41fd-bac4-9256acbf97bc",
 		//CacheDir:             "e:/nacos/cache",
 		NotLoadCacheAtStart:  true,
 		UpdateCacheWhenEmpty: false,
@@ -43,65 +49,54 @@ func main() {
 		"clientConfig":  cc,
 	})
 
-	http.HandleFunc("/", process)
+	sub()
+
+	http.HandleFunc("/", middleware(process))
 	http.ListenAndServe(":5050", nil)
 }
 
-func process(w http.ResponseWriter, r *http.Request) {
+func middleware(hfunc func(w http.ResponseWriter, r *http.Request)) func(http.ResponseWriter, *http.Request) {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Println("request:" + r.RemoteAddr)
+		hfunc(w, r)
+		fmt.Println(string(reflect.ValueOf(w).Elem().FieldByName("w").Elem().FieldByName("buf").Bytes()))
+	})
+}
+
+func process(response http.ResponseWriter, request *http.Request) {
 	//获取url 即 问号之前那部分
-	urlString := r.RequestURI
+	urlString := request.RequestURI
 	if strings.Index(urlString, "?") > 0 {
 		urlString = urlString[0:strings.Index(urlString, "?")]
 	}
 
 	//如果是默认根目录，则返回204
 	if urlString == "/" {
-		w.WriteHeader(204)
+		response.WriteHeader(204)
 		return
 	}
 
 	//取url串的第一节的小写字母为服务名 如/A/b/c  则a为当前要请求的服务名
 	serviceName := strings.ToLower(strings.Split(urlString, "/")[1])
 
-	services, err := client.GetAllServicesInfo(vo.GetAllServiceInfoParam{
-		NameSpace: "c0d565da-10ef-40a4-84b2-0b19dc25c4db",
-		PageNo:    1,
-		PageSize:  999,
-	})
-
-	//判断当前请求的服务是否在nacos的服务列表里
-	isExistService := false
-	for _, v := range services.Doms {
-		if strings.ToLower(v) == serviceName {
-			isExistService = true
-			break
-		}
-	}
-
 	//如果不存在，则返回404
-	if !isExistService {
-		w.WriteHeader(404)
+	if _, ok := ServiceRoute[serviceName]; !ok {
+		response.WriteHeader(404)
 		return
 	}
 
-	//获取该服务下的实例列表
-	instances, err := client.SelectAllInstances(vo.SelectAllInstancesParam{
-		ServiceName: serviceName,
-		GroupName:   "DEFAULT_GROUP",
-	})
-
+	//按权重填充，并随机抽取一个值
 	var choices []wr.Choice
-	for _, v := range instances {
-		c := wr.Choice{Item: fmt.Sprintf("http://%s:%d", v.Ip, v.Port), Weight: uint(v.Weight) * 5}
+	rwLock.RLock()
+	for _, instance := range ServiceRoute[serviceName] {
+		c := wr.Choice{Item: fmt.Sprintf("http://%s:%d", instance.Ip, instance.Port), Weight: uint(instance.Weight)}
 		choices = append(choices, c)
 	}
+	rwLock.RUnlock()
 	chooser, _ := wr.NewChooser(choices...)
 	targetHost := chooser.Pick().(string)
 
-	//fmt.Println(targetHost)
-
 	targetHost = "http://127.0.0.1:5151"
-
 	remote, err := url.Parse(targetHost)
 
 	if err != nil {
@@ -109,6 +104,60 @@ func process(w http.ResponseWriter, r *http.Request) {
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(remote)
+	proxy.ServeHTTP(response, request)
+}
 
-	proxy.ServeHTTP(w, r)
+func sub() {
+	//从nacos上拉取注册的服务列表
+	services, _ := client.GetAllServicesInfo(vo.GetAllServiceInfoParam{
+		PageNo:   1,
+		PageSize: 9999,
+	})
+
+	//对列表中的每一个服务都订阅
+	for _, v := range services.Doms {
+		client.Subscribe(&vo.SubscribeParam{
+			ServiceName:       v,
+			SubscribeCallback: changeNotity,
+		})
+	}
+}
+
+func changeNotity(subInstances []model.SubscribeService, err error) {
+	//不处理空推送
+	if len(subInstances) == 0 {
+		return
+	}
+
+	//遍历订阅服务列表
+	for _, subInstance := range subInstances {
+		//判断当前服务是否存在本地服务路由表中，如果不在则加入进去
+		if _, ok := ServiceRoute[subInstance.ServiceName]; !ok {
+			ServiceRoute[subInstance.ServiceName] = append(ServiceRoute[subInstance.ServiceName], subInstance)
+			continue
+		}
+
+		//当前 根据服务名、IP、端口 确定该服务是否已登记，后续可考虑加入版本号
+		hasThisInstance := false
+		currentInstanceIndex := -1
+		for i, currentLocalInstance := range ServiceRoute[subInstance.ServiceName] {
+			if currentLocalInstance.ServiceName == subInstance.ServiceName && currentLocalInstance.Ip == subInstance.Ip && currentLocalInstance.Port == subInstance.Port {
+				hasThisInstance = true
+				currentInstanceIndex = i
+				break
+			}
+		}
+		//如果当前实例不存在就登记进来
+		if !hasThisInstance && subInstance.Valid == true {
+			ServiceRoute[subInstance.ServiceName] = append(ServiceRoute[subInstance.ServiceName], subInstance)
+		}
+		//如果已存在，且推送的状态为Valid，则移除掉
+		if hasThisInstance && subInstance.Valid == false {
+			beforeList := ServiceRoute[subInstance.ServiceName][:currentInstanceIndex]
+			afterList := ServiceRoute[subInstance.ServiceName][currentInstanceIndex+1:]
+			rwLock.Lock()
+			ServiceRoute[subInstance.ServiceName] = append(beforeList, afterList...)
+			rwLock.Unlock()
+		}
+	}
 }
