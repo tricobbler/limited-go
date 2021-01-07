@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -51,16 +50,8 @@ func main() {
 
 	sub()
 
-	http.HandleFunc("/", middleware(process))
+	http.HandleFunc("/", process)
 	http.ListenAndServe(":5050", nil)
-}
-
-func middleware(hfunc func(w http.ResponseWriter, r *http.Request)) func(http.ResponseWriter, *http.Request) {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Println("request:" + r.RemoteAddr)
-		hfunc(w, r)
-		fmt.Println(string(reflect.ValueOf(w).Elem().FieldByName("w").Elem().FieldByName("buf").Bytes()))
-	})
 }
 
 func process(response http.ResponseWriter, request *http.Request) {
