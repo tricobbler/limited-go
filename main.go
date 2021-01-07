@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"github.com/gin-gonic/gin"
 	wr "github.com/mroth/weightedrand"
 	"github.com/nacos-group/nacos-sdk-go/clients"
 	"github.com/nacos-group/nacos-sdk-go/clients/naming_client"
@@ -17,44 +18,38 @@ import (
 	"time"
 )
 
-var rwLock *sync.RWMutex
-var client naming_client.INamingClient
-var ServiceRoute map[string][]model.SubscribeService
+var rwLock *sync.RWMutex                             //读写锁
+var client naming_client.INamingClient               //nacos客户端
+var ServiceRoute map[string][]model.SubscribeService //本地服务缓存
 
 func main() {
 	rand.Seed(time.Now().UTC().UnixNano())
 	ServiceRoute = make(map[string][]model.SubscribeService)
 	rwLock = new(sync.RWMutex)
 
-	sc := []constant.ServerConfig{
-		{
-			IpAddr: "mse-e52dbdd6-p.nacos-ans.mse.aliyuncs.com",
-			Port:   8848,
-			Scheme: "http",
-		},
-	}
+	//初始化Nacos配置相关信息
+	initDiscovery()
 
-	cc := constant.ClientConfig{
-		TimeoutMs:   500,
-		NamespaceId: "27fdefc2-ae39-41fd-bac4-9256acbf97bc",
-		//CacheDir:             "e:/nacos/cache",
-		NotLoadCacheAtStart:  true,
-		UpdateCacheWhenEmpty: false,
-		//LogDir:               "e:/nacos/log",
-	}
+	//订阅服务
+	subServices()
 
-	client, _ = clients.CreateNamingClient(map[string]interface{}{
-		"serverConfigs": sc,
-		"clientConfig":  cc,
+	gin.SetMode(gin.ReleaseMode)
+	route := gin.New()
+	route.Use(func(context *gin.Context) {
+
+		beginTime := time.Now().UnixNano()
+
+		Middleware(context.Writer, context.Request)
+
+		endTime := time.Now().UnixNano()
+
+		fmt.Println(endTime - beginTime)
 	})
 
-	sub()
-
-	http.HandleFunc("/", process)
-	http.ListenAndServe(":5050", nil)
+	route.Run(":5050")
 }
 
-func process(response http.ResponseWriter, request *http.Request) {
+func Middleware(response http.ResponseWriter, request *http.Request) {
 	//获取url 即 问号之前那部分
 	urlString := request.RequestURI
 	if strings.Index(urlString, "?") > 0 {
@@ -98,7 +93,31 @@ func process(response http.ResponseWriter, request *http.Request) {
 	proxy.ServeHTTP(response, request)
 }
 
-func sub() {
+func initDiscovery() {
+	sc := []constant.ServerConfig{
+		{
+			IpAddr: "mse-e52dbdd6-p.nacos-ans.mse.aliyuncs.com",
+			Port:   8848,
+			Scheme: "http",
+		},
+	}
+
+	cc := constant.ClientConfig{
+		TimeoutMs:   500,
+		NamespaceId: "27fdefc2-ae39-41fd-bac4-9256acbf97bc",
+		//CacheDir:             "e:/nacos/cache",
+		NotLoadCacheAtStart:  true,
+		UpdateCacheWhenEmpty: false,
+		//LogDir:               "e:/nacos/log",
+	}
+
+	client, _ = clients.CreateNamingClient(map[string]interface{}{
+		"serverConfigs": sc,
+		"clientConfig":  cc,
+	})
+}
+
+func subServices() {
 	//从nacos上拉取注册的服务列表
 	services, _ := client.GetAllServicesInfo(vo.GetAllServiceInfoParam{
 		PageNo:   1,
